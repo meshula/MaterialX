@@ -1,4 +1,5 @@
 #include <MaterialXView/Viewer.h>
+#include <MaterialXView/LabCamera.h>
 
 #include <MaterialXRenderGlsl/GLTextureHandler.h>
 #include <MaterialXRenderGlsl/GLUtil.h>
@@ -169,16 +170,13 @@ Viewer::Viewer(const std::string& materialFilename,
         multiSampleCount),
     _meshRotation(meshRotation),
     _meshScale(meshScale),
-    _cameraPosition(cameraPosition),
-    _cameraTarget(cameraTarget),
-    _cameraUp(0.0f, 1.0f, 0.0f),
-    _cameraViewAngle(cameraViewAngle),
-    _cameraNearDist(0.05f),
-    _cameraFarDist(5000.0f),
-    _userCameraEnabled(true),
-    _userTranslationActive(false),
+    _buttonLeft(false),
+    _buttonRight(false),
+    _camera(nullptr),
+    _cameraInteraction(nullptr),
+    _cameraInteractionPhase(lc_i_PhaseNone),
+    _cameraInteractionMode(lc_i_ModeArcball),
     _userTranslationPixel(0, 0),
-    _userScale(1.0f),
     _libraryFolders(libraryFolders),
     _searchPath(searchPath),
     _materialFilename(materialFilename),
@@ -344,9 +342,15 @@ Viewer::Viewer(const std::string& materialFilename,
 
     // Initialize camera
     initCamera();
+    void lc_mount_look_at(lc_mount*, lc_v3f eye, lc_v3f target, lc_v3f up);
+    lc_mount_look_at(&_camera->mount, { cameraPosition[0], cameraPosition[1], cameraPosition[2] }, { cameraTarget[0], cameraTarget[1], cameraTarget[2] }, { 0.f, 1.f, 0.f });
+    _camera->optics.focal_length = lc_sensor_focal_length_from_vertical_FOV(&_camera->sensor, radians_from_degrees(lc_degrees{ cameraViewAngle }));
+    _camera->optics.znear = 0.05f;
+    _camera->optics.zfar = 5000.f;
+
     setResizeCallback([this](ng::Vector2i size)
     {
-        _arcball.setSize(size);
+        _viewportSize = size;
     });
 
     // Update geometry selections.
@@ -548,10 +552,15 @@ void Viewer::createLoadMeshInterface(Widget* parent, const std::string& label)
 
                 _meshRotation = mx::Vector3();
                 _meshScale = 1.0f;
-                _cameraPosition = DEFAULT_CAMERA_POSITION;
-                _cameraTarget = mx::Vector3();
-                _cameraViewAngle = DEFAULT_CAMERA_VIEW_ANGLE;
+
                 initCamera();
+
+                void lc_mount_look_at(lc_mount*, lc_v3f eye, lc_v3f target, lc_v3f up);
+                lc_mount_look_at(&_camera->mount, { DEFAULT_CAMERA_POSITION[0], DEFAULT_CAMERA_POSITION[1], DEFAULT_CAMERA_POSITION[2] },
+                    { 0.f, 0.f, 0.f }, { 0.f, 1.f, 0.f });
+                _camera->optics.focal_length = lc_sensor_focal_length_from_vertical_FOV(&_camera->sensor, radians_from_degrees(lc_degrees{ DEFAULT_CAMERA_VIEW_ANGLE }));
+                _camera->optics.znear = 0.05f;
+                _camera->optics.zfar = 5000.f;
 
                 invalidateShadowMap();
             }
@@ -1419,16 +1428,15 @@ bool Viewer::keyboardEvent(int key, int scancode, int action, int modifiers)
     }
 
     // Adjust camera zoom.
-    if (_userCameraEnabled)
+    if (key == GLFW_KEY_KP_ADD && action == GLFW_PRESS)
     {
-        if (key == GLFW_KEY_KP_ADD && action == GLFW_PRESS)
-        {
-            _userScale *= 1.1f;
-        }
-        if (key == GLFW_KEY_KP_SUBTRACT && action == GLFW_PRESS)
-        {
-            _userScale = std::max(0.1f, _userScale * 0.9f);
-        }
+        _camera->sensor.enlarge.x *= 1.1f;
+        _camera->sensor.enlarge.y = _camera->sensor.enlarge.x;
+    }
+    if (key == GLFW_KEY_KP_SUBTRACT && action == GLFW_PRESS)
+    {
+        _camera->sensor.enlarge.x = std::max(0.1f, _camera->sensor.enlarge.x * 0.9f);
+        _camera->sensor.enlarge.y = _camera->sensor.enlarge.x;
     }
 
     // Reload the current document, and optionally the standard libraries, from
@@ -1877,13 +1885,9 @@ bool Viewer::scrollEvent(const ng::Vector2i& p, const ng::Vector2f& rel)
         return true;
     }
 
-    if (_userCameraEnabled)
-    {
-        _userScale = std::max(0.1f, _userScale * ((rel.y() > 0) ? 1.1f : 0.9f));
-        return true;
-    }
-
-    return false;
+    _camera->sensor.enlarge.x = std::max(0.1f, _camera->sensor.enlarge.x * ((rel.y() > 0) ? 1.1f : 0.9f));
+    _camera->sensor.enlarge.y = _camera->sensor.enlarge.x;
+    return true;
 }
 
 bool Viewer::mouseMotionEvent(const ng::Vector2i& p,
@@ -1893,16 +1897,39 @@ bool Viewer::mouseMotionEvent(const ng::Vector2i& p,
 {
     if (Screen::mouseMotionEvent(p, rel, button, modifiers))
     {
+        _cameraInteractionPhase = lc_i_PhaseNone;
         return true;
     }
 
-    if (_arcball.motion(p))
+    _cameraInteractionPhase = lc_update_phase(_cameraInteractionPhase, _buttonLeft || _buttonRight);
+    printf("%d\n", _cameraInteractionPhase);
+    if (button == GLFW_MOUSE_BUTTON_1)
     {
-        return true;
+        _cameraInteractionMode = modifiers ? lc_i_ModePanTilt : lc_i_ModeArcball;
+    }
+    else if (button == GLFW_MOUSE_BUTTON_2)
+    {
+        _cameraInteractionMode = modifiers ? lc_i_ModeCrane : lc_i_ModeDolly;
     }
 
+    {
+        float dt = 1.f / 60.f;
+        InteractionToken tok = lc_i_begin_interaction(_cameraInteraction, 
+                                                      { static_cast<float>(_viewportSize[0]), static_cast<float>(_viewportSize[1]) });
+        lc_i_ttl_interaction(_cameraInteraction, _camera, tok, 
+                             _cameraInteractionPhase, _cameraInteractionMode, 
+                             { static_cast<float>(p[0]), static_cast<float>(p[1]) }, 
+                             lc_radians{ 0 }, dt);
+        lc_i_end_interaction(_cameraInteraction, tok);
+        return true;
+    }
+#if 0
     if (_userTranslationActive)
     {
+        if the mode is not arcball, then use this logic to find the plane to 
+            run the constrained ttl mode
+
+
         updateViewHandlers();
         const mx::Matrix44& world = _cameraViewHandler->worldMatrix;
         const mx::Matrix44& view = _cameraViewHandler->viewMatrix;
@@ -1936,47 +1963,42 @@ bool Viewer::mouseMotionEvent(const ng::Vector2i& p,
 
         return true;
     }
-
     return false;
+
+#endif
 }
 
 bool Viewer::mouseButtonEvent(const ng::Vector2i& p, int button, bool down, int modifiers)
 {
+    if (button == GLFW_MOUSE_BUTTON_1)
+    {
+        _buttonLeft = down;
+    }
+    if (button == GLFW_MOUSE_BUTTON_3)
+    {
+        _buttonRight = down;
+    }
+
     if (Screen::mouseButtonEvent(p, button, down, modifiers))
     {
         return true;
     }
 
-    if (button == GLFW_MOUSE_BUTTON_1 && !modifiers)
-    {
-        _arcball.button(p, down);
-    }
-    else if (button == GLFW_MOUSE_BUTTON_2 ||
-            (button == GLFW_MOUSE_BUTTON_1 && modifiers == GLFW_MOD_SHIFT))
-    {
-        _userTranslationStart = _userTranslation;
-        _userTranslationActive = true;
-        _userTranslationPixel = p;
-    }
-    if (button == GLFW_MOUSE_BUTTON_1 && !down)
-    {
-        _arcball.button(p, false);
-    }
-    if (!down)
-    {
-        _userTranslationActive = false;
-    }
-    return true;
+    return false;
 }
 
 void Viewer::initCamera()
 {
-    _arcball = ng::Arcball();
-    _arcball.setSize(mSize);
+    if (_camera)
+        delete _camera;
 
-    // Disable user camera controls when non-centered views are requested.
-    _userCameraEnabled = _cameraTarget == mx::Vector3(0.0) &&
-                         _meshScale == 1.0f;
+    _camera = new lc_camera;
+    lc_camera_set_defaults(_camera);
+
+    if (_cameraInteraction)
+        lc_i_free_interactive_controller(_cameraInteraction);
+
+    _cameraInteraction = lc_i_create_interactive_controller();
 
     if (_geometryHandler->getMeshes().empty())
     {
@@ -1987,34 +2009,28 @@ void Viewer::initCamera()
                                 mx::Matrix44::createRotationY(_meshRotation[1] / 180.0f * PI) *
                                 mx::Matrix44::createRotationX(_meshRotation[0] / 180.0f * PI);
 
-    if (_userCameraEnabled)
-    {
-        _meshTranslation = -meshRotation.transformPoint(mesh->getSphereCenter());
-        _meshScale = IDEAL_MESH_SPHERE_RADIUS / mesh->getSphereRadius();
-    }
+    _meshTranslation = -meshRotation.transformPoint(mesh->getSphereCenter());
+    _meshScale = IDEAL_MESH_SPHERE_RADIUS / mesh->getSphereRadius();
 }
 
 void Viewer::updateViewHandlers()
 {
-    float fH = std::tan(_cameraViewAngle / 360.0f * PI) * _cameraNearDist;
-    float fW = fH * (float) mSize.x() / (float) mSize.y();
+    float aspect = (float)mSize.x() / (float)mSize.y();
+    lc_m44f m = lc_camera_perspective(_camera, aspect);
+    memcpy(&_cameraViewHandler->projectionMatrix[0], &m.x.x, sizeof(float) * 16);
+    m = lc_mount_gl_view_transform(&_camera->mount);
+    memcpy(&_cameraViewHandler->viewMatrix[0], &m.x.x, sizeof(float) * 16);
 
     mx::Matrix44 meshRotation = mx::Matrix44::createRotationZ(_meshRotation[2] / 180.0f * PI) *
                                 mx::Matrix44::createRotationY(_meshRotation[1] / 180.0f * PI) *
                                 mx::Matrix44::createRotationX(_meshRotation[0] / 180.0f * PI);
 
-    mx::Matrix44 arcball = mx::Matrix44::IDENTITY;
-    if (_userCameraEnabled)
-    {
-        ng::Matrix4f ngArcball = _arcball.matrix();
-        arcball = mx::Matrix44(ngArcball.data(), ngArcball.data() + ngArcball.size());
-    }
+    mx::Matrix44 world = meshRotation *
+        mx::Matrix44::createTranslation(_meshTranslation) *
+        mx::Matrix44::createScale(mx::Vector3(_meshScale));
 
-    _cameraViewHandler->worldMatrix = meshRotation *
-                                      mx::Matrix44::createTranslation(_meshTranslation + _userTranslation) *
-                                      mx::Matrix44::createScale(mx::Vector3(_meshScale * _userScale));
-    _cameraViewHandler->viewMatrix = arcball * mx::ViewHandler::createViewMatrix(_cameraPosition, _cameraTarget, _cameraUp);
-    _cameraViewHandler->projectionMatrix = mx::ViewHandler::createPerspectiveMatrix(-fW, fW, -fH, fH, _cameraNearDist, _cameraFarDist);
+    m = lc_mount_model_view_transform_f16(&_camera->mount, &world[0][0]);
+    memcpy(&_cameraViewHandler->worldMatrix[0], &m.x.x, sizeof(float) * 16);
 
     mx::NodePtr dirLight = _lightHandler->getFirstLightOfCategory(DIR_LIGHT_NODE_CATEGORY);
     if (dirLight)
@@ -2028,7 +2044,8 @@ void Viewer::updateViewHandlers()
         if (value->isA<mx::Vector3>())
         {
             mx::Vector3 dir = mx::Matrix44::createRotationY(_lightRotation / 180.0f * PI).transformVector(value->asA<mx::Vector3>());
-            _shadowViewHandler->viewMatrix = mx::ViewHandler::createViewMatrix(dir * -r, mx::Vector3(0.0f), _cameraUp);
+            lc_v3f up = lc_rt_up(&_camera->mount.transform);
+            _shadowViewHandler->viewMatrix = mx::ViewHandler::createViewMatrix(dir * -r, mx::Vector3(0.0f), mx::Vector3(up.x, up.y, up.z));
         }
     }
 }

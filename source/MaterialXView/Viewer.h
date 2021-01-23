@@ -3,6 +3,7 @@
 
 #include <MaterialXView/Editor.h>
 #include <MaterialXView/Material.h>
+#include <MaterialXView/LabCamera.h>
 
 #include <MaterialXRenderGlsl/GLFramebuffer.h>
 
@@ -139,25 +140,20 @@ class Viewer : public ng::Screen
 
   private:
     ng::Window* _window;
-    ng::Arcball _arcball;
 
     mx::Vector3 _meshTranslation;
     mx::Vector3 _meshRotation;
     float _meshScale;
 
-    mx::Vector3 _cameraPosition;
-    mx::Vector3 _cameraTarget;
-    mx::Vector3 _cameraUp;
-    float _cameraViewAngle;
-    float _cameraNearDist;
-    float _cameraFarDist;
-
-    bool _userCameraEnabled;
+    lc_camera* _camera;
+    lc_interaction* _cameraInteraction;
+    lc_i_Phase _cameraInteractionPhase;
+    lc_i_Mode _cameraInteractionMode;
+    bool _buttonLeft, _buttonRight;
+    ng::Vector2i _viewportSize;
     mx::Vector3 _userTranslation;
     mx::Vector3 _userTranslationStart;
-    bool _userTranslationActive;
     ng::Vector2i _userTranslationPixel;
-    float _userScale;
 
     // Document management
     mx::FilePathVec _libraryFolders;
